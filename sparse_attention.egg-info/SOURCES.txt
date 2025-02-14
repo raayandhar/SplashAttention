@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+sparse_attention.cu
+sparse_attention.egg-info/PKG-INFO
+sparse_attention.egg-info/SOURCES.txt
+sparse_attention.egg-info/dependency_links.txt
+sparse_attention.egg-info/top_level.txt
