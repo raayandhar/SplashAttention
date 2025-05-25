@@ -6,3 +6,6 @@
 *.fatbin
 build/
 dist/
+*.egg-info/
+.vscode/
+*.so

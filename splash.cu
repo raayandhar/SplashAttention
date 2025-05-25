@@ -4,7 +4,8 @@
 #include <stdio.h>
 
 #define BLOCK_M 32
-#define BLOCK_N 32
+#define BLOCK_N 32 // should be a multiple of BLOCK_M
+#define D_MAX 128
 
 __device__ inline float load_or(const float* ptr, int idx, int max_idx, float other) {
     if (idx < 0 || idx >= max_idx) {
@@ -13,6 +14,12 @@ __device__ inline float load_or(const float* ptr, int idx, int max_idx, float ot
     return ptr[idx];
 }
 
+/*
+Sparse flash attention kernel:
+
+This implements the hash-based Sparse Causal Flash Attention (SCFA) from the 2023 paper by Pagliardini et al:
+https://arxiv.org/pdf/2306.01160
+*/
 __global__
 void sparse_attention_forward_kernel(
     // Q, K, V
@@ -36,9 +43,17 @@ void sparse_attention_forward_kernel(
     int d
 )
 {
-    int block_m_id = blockIdx.x;  
-    int bh_id = blockIdx.y;
-    int thread_id = threadIdx.x;
+
+    /* Block-wise layout:
+    A 2D grid of blocks, where each block column on the y-dimension handles one batch & head (B*H columns, each column handles data shape [seq_len, dim]).
+    Each block within its column handles BLOCK_M queries. For queries, our data shape is [BLOCK_M, dim].
+    Each thread within a block handles a single query.
+
+    Q_idx and K_idx refer to the Q and K original sequence indices.
+    */
+    int block_m_id = blockIdx.x; 
+    int bh_id = blockIdx.y; 
+    int thread_id = threadIdx.x; 
 
     int b = bh_id / H;  // batch index
     int h = bh_id % H;  // head index
@@ -51,16 +66,19 @@ void sparse_attention_forward_kernel(
 
     size_t q_offset = bh_offset_qkv + (size_t)q_i * d;
 
-    float m_prev = -INFINITY;
-    float l_prev = 0.0f;
-    __shared__ float acc_s[BLOCK_M * 128];
-
-    float q_val[128];  // for d <= 128
+    // ======= Load query vector & L and M values into thread registers =======
+    if (d > D_MAX) {
+        printf("Error: Kernel not engineered for d > %d\n", D_MAX);
+        return;
+    }
+    float q_val[D_MAX]; 
     #pragma unroll
     for (int dim = 0; dim < d; dim++) {
         q_val[dim] = 0.0f;
     }
 
+    float m_prev = -INFINITY;
+    float l_prev = 0.0f;
     // "masked" loads
     if (q_i < NQ) {
         #pragma unroll
@@ -71,26 +89,23 @@ void sparse_attention_forward_kernel(
         m_prev = M[bh_offset_LM + q_i]; 
     }
 
-    float acc[128];
-    #pragma unroll
-    for (int dim = 0; dim < d; dim++) {
-        acc[dim] = 0.0f;
-    }
+    // ======= Load query sequence indices into shared memory =======
+    // Each thread has one query index, and we synchronize between threads in the block
+    // to get the max query index in the block.
 
-    int Qi = -1;
+    int Qi = -1; // Qi is the sequence index for the current query
     if (q_i < NQ) {
         size_t bh_offset_idxQ = (size_t)b * H * NQ + (size_t)h * NQ;
         Qi = Q_idx[bh_offset_idxQ + q_i];
     }
-
-    int max_Qi_block = Qi;
 
     __shared__ int qi_sh[BLOCK_M];
     if (thread_id < BLOCK_M) {
         qi_sh[thread_id] = (q_i < NQ) ? Qi : -1; 
     }
     __syncthreads();
-
+    // TODO: profile - if slow, replace with block-wide reduction
+    // right now thread 0 does a linear scan
     if (thread_id == 0) {
         int block_max = -1;
         for (int i = 0; i < BLOCK_M; i++) {
@@ -100,15 +115,18 @@ void sparse_attention_forward_kernel(
     }
     __syncthreads();
     int block_max_Qi = qi_sh[0];
-
-    int end_n_blocks = 0;
+    int end_n_blocks = 0; // accumulator for the number of blocks we need to process (e.g blocks that fall below the causal mask)
+    // Each thread processes NK / BLOCK_M indices of K
     for (int start_n = 0; start_n < NK; start_n += BLOCK_N) {
-        float local_min = 1e9f;
+        // Within this loop, we're processing a single block of K. Each thread
+        // processes BLOCK_N / BLOCK_M keys.
+        float local_min = INFINITY;
         for (int x = thread_id; x < BLOCK_N; x += blockDim.x) {
+            // Get smallest K index among the keys this thread is handling
             int kn = start_n + x;
             int val = (kn < NK)
                 ? K_idx[(b * H + h) * NK + kn]
-                : 1e9; 
+                : INFINITY; 
             if (val < local_min) {
                 local_min = (float)val;
             }
@@ -118,9 +136,9 @@ void sparse_attention_forward_kernel(
         min_sh[thread_id] = local_min;
         __syncthreads();
 
-        // block-wide reduce min
+        // block-wide reduce min. TODO: replace with actual block-wide reduction
         if (thread_id == 0) {
-            float block_min = 1e9f;
+            float block_min = INFINITY;
             for (int i = 0; i < BLOCK_M; i++) {
                 if (min_sh[i] < block_min) {
                     block_min = min_sh[i];
@@ -131,23 +149,37 @@ void sparse_attention_forward_kernel(
         __syncthreads();
         float block_min_ki = min_sh[0];
 
-        // If the min_ki <= max_Qi, we need that block
-        // If block_min_ki == 1e9, that means it's out of range
-        if (block_min_ki <= block_max_Qi && block_min_ki < 1e9) {
+        // If the min_ki <= max_Qi, we need that block - some query can attend to a prior key
+        // If block_min_ki == INFINITY, that means it's out of range
+        if (block_min_ki <= block_max_Qi && block_min_ki < INFINITY) {
             end_n_blocks += 1;
         } else {
             // no more blocks needed
         }
     }
 
+    // ======= Load K and V into shared memory =======
+    // Each thread loads BLOCK_N / BLOCK_M keys and values
+    // We load the keys and values into shared memory, and then use them in the dot product
+    // with the query vector.
+
+    // ======= Initialize accumulator =======
+    float acc[D_MAX];
+    #pragma unroll
+    for (int dim = 0; dim < d; dim++) {
+        acc[dim] = 0.0f;
+    }
     int n_blocks_done = 0;
     for (int start_n = 0; start_n < NK && n_blocks_done < end_n_blocks; start_n += BLOCK_N) {
-        float local_min = 1e9f;
+        float local_min = INFINITY;
+        // In this block, we process BLOCK_N / BLOCK_M keys per thread.
+
+        // Find min key index in block
         for (int x = thread_id; x < BLOCK_N; x += blockDim.x) {
             int kn = start_n + x;
             int val = (kn < NK)
                 ? K_idx[(b * H + h) * NK + kn]
-                : 1e9; 
+                : INFINITY; 
             if (val < local_min) {
                 local_min = (float)val;
             }
@@ -156,7 +188,7 @@ void sparse_attention_forward_kernel(
         min_sh2[thread_id] = local_min;
         __syncthreads();
         if (thread_id == 0) {
-            float block_min_ki = 1e9f;
+            float block_min_ki = INFINITY;
             for (int i = 0; i < BLOCK_M; i++) {
                 block_min_ki = fminf(block_min_ki, min_sh2[i]);
             }
@@ -165,20 +197,22 @@ void sparse_attention_forward_kernel(
         __syncthreads();
         float block_min_ki = min_sh2[0];
         // check if we skip
-        if (block_min_ki > block_max_Qi || block_min_ki >= 1e9f) {
+        if (block_min_ki > block_max_Qi || block_min_ki >= INFINITY) {
             // skip
             continue;
         }
         n_blocks_done += 1;
 
+        // ====== Compute dot products for loaded BLOCK_M queries * BLOCK_N keys =======
         float qk[BLOCK_N];
         #pragma unroll
         for (int i = 0; i < BLOCK_N; i++) {
             qk[i] = -INFINITY;  
         }
 
-        __shared__ float k_sh[BLOCK_N * 128];
-        __shared__ float v_sh[BLOCK_N * 128];
+        // Load keys & values into shared mem - threads individually hold queries
+        __shared__ float k_sh[BLOCK_N * D_MAX];
+        __shared__ float v_sh[BLOCK_N * D_MAX];
         __shared__ int   ki_sh[BLOCK_N];
 
         for (int x = thread_id; x < BLOCK_N; x += blockDim.x) {
@@ -186,7 +220,7 @@ void sparse_attention_forward_kernel(
             if (kn < NK) {
                 ki_sh[x] = K_idx[(b * H + h) * NK + kn];
             } else {
-                ki_sh[x] = 1e9;
+                ki_sh[x] = INFINITY;
             }
         }
 

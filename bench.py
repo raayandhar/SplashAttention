@@ -8,7 +8,6 @@ minimal_attn = load(
     name="minimal_attn", sources=["main.cpp", "splash.cu"], extra_cuda_cflags=["-O2"]
 )
 
-
 def manual_sparse_attn(q, k, v, Q_idx, K_idx, sm_scale):
     """
     We'll replicate the causal mask logic:
