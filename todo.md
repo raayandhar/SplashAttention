@@ -5,3 +5,4 @@ Some improvements:
     - paged / compress KV cache
     - hash-based attention
  - cleanup and write better benchmarking code
+ - Use templating to vary the kernel for different values of d

@@ -7,7 +7,7 @@ setup(
     name='splash_attention',
     ext_modules=[
         CUDAExtension('splash_attention', [
-            'splash_attention.cu',
+            'splash.cu',
         ]),
     ],
     cmdclass={

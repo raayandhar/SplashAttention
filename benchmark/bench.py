@@ -1,13 +1,14 @@
 import math
-
+import os
 import torch
 from torch.nn import functional as F
 from torch.utils.cpp_extension import load
 
 minimal_attn = load(
-    name="minimal_attn", sources=["main.cpp", "splash.cu"], extra_cuda_cflags=["-O2"]
+    name="minimal_attn", sources=[os.path.join(os.path.dirname(__file__), "../source/main.cpp"), 
+                                  os.path.join(os.path.dirname(__file__), "../source/splash.cu")], 
+                                  extra_cuda_cflags=["-O2"]
 )
-
 
 def manual_sparse_attn(q, k, v, Q_idx, K_idx, sm_scale):
     """
